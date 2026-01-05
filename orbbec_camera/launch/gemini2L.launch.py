@@ -14,7 +14,7 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument("camera_name", default_value="camera"),
         DeclareLaunchArgument("depth_registration", default_value="false"),
-        DeclareLaunchArgument("serial_number", default_value=""),
+        DeclareLaunchArgument("serial_number", default_value="AY8M63P002L"),
         DeclareLaunchArgument("usb_port", default_value=""),
         DeclareLaunchArgument("device_num", default_value="1"),
         DeclareLaunchArgument("uvc_backend", default_value="libuvc"),  # libuvc or v4l2

@@ -34,8 +34,44 @@
 
 #include <malloc.h>
 
+#include <unordered_map>
 namespace orbbec_camera {
 using namespace std::chrono_literals;
+
+namespace {
+struct StreamRecoveryState {
+  std::atomic<int64_t> last_frameset_ns{0};
+  std::atomic<bool> recovering{false};
+  rclcpp::TimerBase::SharedPtr watchdog_timer;
+};
+
+// Map OBCameraNode instance -> recovery state.
+// We keep this here to avoid changing the public header for a local patch.
+std::mutex g_recovery_map_mtx;
+std::unordered_map<const orbbec_camera::OBCameraNode*, std::shared_ptr<StreamRecoveryState>> g_recovery_map;
+
+inline int64_t nowSteadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::shared_ptr<StreamRecoveryState> getRecoveryState(const orbbec_camera::OBCameraNode* self) {
+  std::lock_guard<std::mutex> lk(g_recovery_map_mtx);
+  auto it = g_recovery_map.find(self);
+  if (it != g_recovery_map.end()) return it->second;
+  auto st = std::make_shared<StreamRecoveryState>();
+  st->last_frameset_ns.store(nowSteadyNs());
+  g_recovery_map.emplace(self, st);
+  return st;
+}
+
+void eraseRecoveryState(const orbbec_camera::OBCameraNode* self) {
+  std::lock_guard<std::mutex> lk(g_recovery_map_mtx);
+  g_recovery_map.erase(self);
+}
+}  // namespace
+
 
 OBCameraNode::OBCameraNode(rclcpp::Node *node, std::shared_ptr<ob::Device> device,
                            std::shared_ptr<Parameters> parameters, bool use_intra_process)
@@ -47,6 +83,7 @@ OBCameraNode::OBCameraNode(rclcpp::Node *node, std::shared_ptr<ob::Device> devic
   RCLCPP_INFO_STREAM(logger_,
                      "OBCameraNode: use_intra_process: " << (use_intra_process ? "ON" : "OFF"));
   is_running_.store(true);
+  (void)getRecoveryState(this);
   stream_name_[COLOR] = "color";
   stream_name_[DEPTH] = "depth";
   stream_name_[INFRA0] = "ir";
@@ -112,7 +149,10 @@ void OBCameraNode::setAndGetNodeParameter(
   }
 }
 
-OBCameraNode::~OBCameraNode() noexcept { clean(); }
+OBCameraNode::~OBCameraNode() noexcept {
+  clean();
+  eraseRecoveryState(this);
+}
 
 void OBCameraNode::rebootDevice() {
   RCLCPP_INFO_STREAM(logger_, "Do clean before rebooting device");
@@ -150,6 +190,19 @@ void OBCameraNode::clean() noexcept {
     }
     if (diagnostic_updater_) {
       diagnostic_updater_.reset();
+// Stop watchdog timer as well (it may trigger recovery during shutdown)
+try {
+  auto st = getRecoveryState(this);
+  if (st && st->watchdog_timer) {
+    st->watchdog_timer->cancel();
+    st->watchdog_timer.reset();
+  }
+  if (st) {
+    st->recovering.store(false);
+  }
+} catch (...) {
+  // Ignore watchdog cleanup exceptions
+}
     }
   } catch (...) {
     // Ignore exceptions during diagnostic cleanup
@@ -1492,6 +1545,97 @@ void OBCameraNode::startStreams() {
     RCLCPP_INFO_STREAM(logger_, "Setting OB_PROP_FRAME_INTERLEAVE_LASER_PATTERN_SYNC_DELAY_INT 0 ");
   }
   pipeline_started_.store(true);
+
+// --------------------------------------------------------------------------
+// Stream watchdog (frame-timeout recovery)
+//
+// Problem: when the camera stream drops while running (USB hiccup / cable wobble),
+// the current driver may stop receiving frames but won't re-start the pipeline.
+// This watchdog monitors the last received FrameSet timestamp and, if frames
+// stop arriving for a while, it stops and restarts the streams until recovery.
+// --------------------------------------------------------------------------
+{
+  auto st = getRecoveryState(this);
+  st->last_frameset_ns.store(nowSteadyNs());
+
+  // Create the timer only once.
+  if (!st->watchdog_timer) {
+    // Tune these values to your environment (Gemini2L + robot boot conditions).
+    constexpr auto kWatchdogPeriod = std::chrono::milliseconds(500);
+    constexpr int64_t kFrameTimeoutNs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(2000)).count();
+    constexpr auto kRetryBackoff = std::chrono::milliseconds(1000);
+
+    RCLCPP_INFO_STREAM(logger_, "Stream watchdog enabled. timeout_ms=2000, period_ms=500");
+
+    st->watchdog_timer = node_->create_wall_timer(kWatchdogPeriod, [this, st, kFrameTimeoutNs, kRetryBackoff]() {
+      if (!rclcpp::ok() || !is_running_.load()) {
+        return;
+      }
+      if (!pipeline_started_.load()) {
+        return;
+      }
+      const int64_t last_ns = st->last_frameset_ns.load();
+      const int64_t now_ns = nowSteadyNs();
+      if (last_ns <= 0) {
+        return;
+      }
+
+      // If frames have stopped for longer than the threshold, start recovery.
+      if ((now_ns - last_ns) > kFrameTimeoutNs) {
+        if (st->recovering.exchange(true)) {
+          return;  // recovery already running
+        }
+
+        RCLCPP_WARN_STREAM(logger_, "No FrameSet received for >2s. Restarting pipeline...");
+
+        std::thread([this, st, kRetryBackoff]() {
+          // Keep trying while the node is alive.
+          for (int attempt = 1; rclcpp::ok() && is_running_.load(); ++attempt) {
+            try {
+              // Stop streams safely
+              try {
+                stopStreams();
+              } catch (const std::exception &e) {
+                RCLCPP_WARN_STREAM(logger_, "stopStreams() during recovery threw: " << e.what());
+              } catch (...) {
+                RCLCPP_WARN_STREAM(logger_, "stopStreams() during recovery threw unknown exception");
+              }
+
+              // Small pause to let the SDK/USB stack settle
+              std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+              // Attempt to restart
+              try {
+                startStreams();
+                st->last_frameset_ns.store(nowSteadyNs());
+                RCLCPP_INFO_STREAM(logger_, "Pipeline recovered successfully (attempt " << attempt << ")");
+                st->recovering.store(false);
+                return;
+              } catch (const ob::Error &e) {
+                RCLCPP_WARN_STREAM(logger_, "startStreams() recovery attempt " << attempt
+                                                 << " failed (ob::Error): " << e.getMessage());
+              } catch (const std::exception &e) {
+                RCLCPP_WARN_STREAM(logger_, "startStreams() recovery attempt " << attempt
+                                                 << " failed: " << e.what());
+              } catch (...) {
+                RCLCPP_WARN_STREAM(logger_, "startStreams() recovery attempt " << attempt
+                                                 << " failed: unknown error");
+              }
+            } catch (...) {
+              // Ignore and backoff
+            }
+
+            std::this_thread::sleep_for(kRetryBackoff);
+          }
+
+          // Node is shutting down
+          st->recovering.store(false);
+        }).detach();
+      }
+    });
+  }
+}
 }
 
 void OBCameraNode::startIMUSyncStream() {
@@ -1581,6 +1725,19 @@ void OBCameraNode::stopStreams() {
     }
     if (diagnostic_updater_) {
       diagnostic_updater_.reset();
+// Stop watchdog timer as well (it may trigger recovery during shutdown)
+try {
+  auto st = getRecoveryState(this);
+  if (st && st->watchdog_timer) {
+    st->watchdog_timer->cancel();
+    st->watchdog_timer.reset();
+  }
+  if (st) {
+    st->recovering.store(false);
+  }
+} catch (...) {
+  // Ignore watchdog cleanup exceptions
+}
     }
   } catch (...) {
     // Ignore exceptions during diagnostic cleanup
@@ -2852,6 +3009,7 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
   if (frame_set == nullptr) {
     return;
   }
+  getRecoveryState(this)->last_frameset_ns.store(nowSteadyNs());
   try {
     if (!tf_published_) {
       publishStaticTransforms();
