@@ -1604,8 +1604,6 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
     RCLCPP_WARN(logger_, "No valid points in point cloud");
     RCLCPP_WARN(logger_, "valid_count == 0");
 
-    // 기존에 modifier/resize(width*height) 했던 내용이 있으니
-    // 깔끔하게 새로 메시지를 "빈(최소 1포인트)" 형태로 재구성하는 게 안전합니다.
     auto empty_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
     sensor_msgs::PointCloud2Modifier m(*empty_msg);
     m.setPointCloud2FieldsByString(1, "xyz");
@@ -1613,7 +1611,7 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
 
     empty_msg->width = 1;
     empty_msg->height = 1;
-    empty_msg->is_dense = false;      // NaN이면 dense=false가 맞아요
+    empty_msg->is_dense = false;
     empty_msg->is_bigendian = false;
     empty_msg->row_step = empty_msg->width * empty_msg->point_step;
     empty_msg->data.resize(empty_msg->height * empty_msg->row_step);
@@ -1634,7 +1632,6 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
     empty_msg->header.stamp = timestamp;
     empty_msg->header.frame_id = frame_id;
 
-    // ★ 중요: 여기서도 depth_cloud_pub_로 publish 해야 함
     depth_cloud_pub_->publish(std::move(empty_msg));
     return;
   }
@@ -1773,8 +1770,6 @@ void OBCameraNode::publishColoredPointCloud(const std::shared_ptr<ob::FrameSet> 
     RCLCPP_WARN(logger_, "No valid points in point cloud");
     RCLCPP_WARN(logger_, "valid_count == 0");
 
-    // 기존에 modifier/resize(width*height) 했던 내용이 있으니
-    // 깔끔하게 새로 메시지를 "빈(최소 1포인트)" 형태로 재구성하는 게 안전합니다.
     auto empty_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
     sensor_msgs::PointCloud2Modifier m(*empty_msg);
     m.setPointCloud2FieldsByString(1, "xyz");
@@ -1782,7 +1777,7 @@ void OBCameraNode::publishColoredPointCloud(const std::shared_ptr<ob::FrameSet> 
 
     empty_msg->width = 1;
     empty_msg->height = 1;
-    empty_msg->is_dense = false;      // NaN이면 dense=false가 맞아요
+    empty_msg->is_dense = false;
     empty_msg->is_bigendian = false;
     empty_msg->row_step = empty_msg->width * empty_msg->point_step;
     empty_msg->data.resize(empty_msg->height * empty_msg->row_step);
@@ -1803,7 +1798,6 @@ void OBCameraNode::publishColoredPointCloud(const std::shared_ptr<ob::FrameSet> 
     empty_msg->header.stamp = timestamp;
     empty_msg->header.frame_id = frame_id;
 
-    // ★ 중요: 여기서도 depth_cloud_pub_로 publish 해야 함
     depth_cloud_pub_->publish(std::move(empty_msg));
     return;
   }
