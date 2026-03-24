@@ -173,9 +173,9 @@ void OBCameraNodeDriver::onDeviceConnected(const std::shared_ptr<ob::DeviceList>
   if (device_list->deviceCount() == 0) {
     return;
   }
-  if (!device_) {
-    startDevice(device_list);
-  }
+  // if (!device_) {
+  //   startDevice(device_list);
+  // }
 }
 
 void OBCameraNodeDriver::onDeviceDisconnected(const std::shared_ptr<ob::DeviceList> &device_list) {
@@ -227,21 +227,44 @@ void OBCameraNodeDriver::checkConnectTimer() {
 }
 
 void OBCameraNodeDriver::queryDevice() {
-  while (is_alive_ && rclcpp::ok() && !device_connected_.load()) {
-    if (!net_device_ip_.empty() && net_device_port_ != 0) {
-      connectNetDevice(net_device_ip_, net_device_port_);
-    } else {
-      auto device_list = ctx_->queryDeviceList();
-      if (device_list->deviceCount() == 0) {
-        RCLCPP_INFO_STREAM(logger_,
-                           "queryDevice :No Device found, using usb event to trigger  "
-                           "OBCameraNodeDriver::onDeviceConnected");
-        return;
-      }
-      startDevice(device_list);
+  while (is_alive_ && rclcpp::ok()) {
+
+    if (device_connected_.load()) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      continue;
     }
+
+    auto device_list = ctx_->queryDeviceList();
+
+    if (device_list->deviceCount() == 0) {
+      RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 2000,
+        "No device found, retrying...");
+      
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      continue;
+    }
+
+    startDevice(device_list);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
   }
 }
+
+// void OBCameraNodeDriver::queryDevice() {
+//   while (is_alive_ && rclcpp::ok() && !device_connected_.load()) {
+//     if (!net_device_ip_.empty() && net_device_port_ != 0) {
+//       connectNetDevice(net_device_ip_, net_device_port_);
+//     } else {
+//       auto device_list = ctx_->queryDeviceList();
+//       if (device_list->deviceCount() == 0) {
+//         RCLCPP_INFO_STREAM(logger_,
+//                            "queryDevice :No Device found, using usb event to trigger  "
+//                            "OBCameraNodeDriver::onDeviceConnected");
+//         return;
+//       }
+//       startDevice(device_list);
+//     }
+//   }
+// }
 
 void OBCameraNodeDriver::resetDevice() {
   while (is_alive_ && rclcpp::ok()) {

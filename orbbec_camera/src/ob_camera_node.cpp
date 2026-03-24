@@ -2123,6 +2123,9 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame> &frame,
   int height = static_cast<int>(video_frame->height());
   auto frame_timestamp = getFrameTimestampUs(frame);
   auto timestamp = fromUsToROSTime(frame_timestamp);
+  // static rclcpp::Clock ros_clock(RCL_ROS_TIME);
+  // rclcpp::Time timestamp = ros_clock.now();
+
   auto device_info = device_->getDeviceInfo();
   CHECK_NOTNULL(device_info);
   auto pid = device_info->pid();
